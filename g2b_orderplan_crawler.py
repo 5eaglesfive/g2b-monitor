@@ -7,7 +7,8 @@
   - 검색유형 : 발주계획
   - 업무구분 : 일반용역   (상세조건 영역의 체크박스)
   - 사업명   : "스마트경로당" "스마트 경로당" "경로당" "경로당 구축" (각각 검색 후 병합·중복제거)
-  - 진행일자 : 화면의 기간 버튼 '6개월' (오늘 포함 최근 6개월, 오늘 기준 6개월 전 ~ 오늘)
+  - 발주시기 : 이번 달부터 앞으로 6개월 이내 (결과 표의 '발주시기' 열로 판정)
+  - 진행일자 : 발주계획 등록일 조회범위. 최근 12개월을 직접 입력 (발주시기 필터가 누락되지 않도록 넓게 조회)
 
 설치
   pip install playwright
@@ -17,19 +18,28 @@
   python g2b_orderplan_crawler.py --headed --debug   # 화면 보며 확인
   python g2b_orderplan_crawler.py                    # 백그라운드 실행
   python g2b_orderplan_crawler.py --inspect          # 입력요소 구조만 저장(개편 대응용)
+  python g2b_orderplan_crawler.py --send-mail --seen-file state/seen_plans.json
+      # Gmail로 결과 발송 (신규 건만). 환경변수: GMAIL_USER, GMAIL_APP_PASSWORD, MAIL_TO
 
 ※ 선택자는 2026-11 화면(업로드 HTML)에서 확인한 id 기준입니다. 개편되면 [화면 설정]만 수정하세요.
-※ 진행일자 입력칸은 읽기 전용(달력/기간버튼 선택식)이라 1·3·6개월 버튼만 지원합니다.
+※ 진행일자 입력칸은 8자리 숫자(YYYYMMDD) 직접 입력을 지원합니다. 실패 시 '6개월' 버튼으로 대체합니다.
 """
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
+import html
+import io
 import json
+import os
 import re
+import smtplib
+import ssl
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
@@ -38,7 +48,8 @@ from playwright.sync_api import Page, sync_playwright
 SEARCH_TYPE = "발주계획"
 BUSINESS_TYPE = "일반용역"
 KEYWORDS = ["스마트경로당", "스마트 경로당", "경로당", "경로당 구축"]
-PERIOD_MONTHS = 6          # 1 / 3 / 6 (화면의 기간 버튼)
+ORDER_MONTHS = 6           # 발주시기: 이번 달부터 앞으로 N개월
+REG_MONTHS = 12            # 진행일자(등록일) 조회범위: 최근 N개월
 PAGE_SIZE = "100"          # 화면의 표시 건수 (10/30/50/100)
 
 # ======================= 화면 설정 (개편 시 여기만 수정) =======================
@@ -355,17 +366,48 @@ def set_business_type(page: Page) -> None:
         log("  ! 업무구분이 의도와 다르게 선택됨 (결과는 업무구분으로 재필터링됩니다)")
 
 
-def set_period(page: Page, months: int) -> None:
-    inp = page.locator(f'{SEL["period_radio"]}[title="{months}개월"]')
-    if not inp.count():
-        raise RuntimeError(f"기간 버튼 '{months}개월'을 찾지 못했습니다.")
-    inp = inp.first
-    if not is_checked(inp):
-        click_option(page, inp)
-    page.wait_for_timeout(500)
+def add_months(d: date, n: int) -> date:
+    y, m = divmod(d.month - 1 + n, 12)
+    y += d.year
+    m += 1
+    return date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+
+def ym_of(text: str) -> tuple[int, int] | None:
+    """'2026/11', '202611', '2026-11-05' 등에서 (연, 월) 추출"""
+    m = re.search(r"(\d{4})\D?(\d{1,2})", text or "")
+    if not m:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    return (y, mo) if 1 <= mo <= 12 else None
+
+
+def type_date(page: Page, selector: str, d: date) -> bool:
+    el = page.locator(selector).first
+    el.click()
+    el.press("Control+A")
+    el.type(d.strftime("%Y%m%d"), delay=40)  # maxlength=8, 포커스를 잃으면 YYYY/MM/DD로 표시됨
+    el.press("Tab")
+    page.wait_for_timeout(400)
+    return el.input_value() == d.strftime("%Y/%m/%d")
+
+
+def set_period(page: Page, reg_months: int) -> str:
+    """진행일자(등록일) 조회범위: 최근 reg_months개월을 직접 입력. 실패 시 6개월 버튼으로 대체."""
+    today = date.today()
+    start = add_months(today, -reg_months) + timedelta(days=1)
+    ok = type_date(page, SEL["date_from"], start) and type_date(page, SEL["date_to"], today)
+    if not ok:
+        log("  ! 진행일자 직접 입력 실패 → '6개월' 버튼으로 대체합니다.")
+        inp = page.locator(f'{SEL["period_radio"]}[title="6개월"]')
+        if not inp.count():
+            raise RuntimeError("진행일자 입력과 기간 버튼 모두 사용할 수 없습니다.")
+        click_option(page, inp.first)
+        page.wait_for_timeout(500)
     d1 = page.locator(SEL["date_from"]).first.input_value()
     d2 = page.locator(SEL["date_to"]).first.input_value()
-    log(f"  진행일자: {d1} ~ {d2} ({months}개월)")
+    log(f"  진행일자(등록일): {d1} ~ {d2}")
+    return f"{d1} ~ {d2}"
 
 
 def run_search(page: Page, keyword: str) -> None:
@@ -451,6 +493,89 @@ def to_record(row: dict) -> dict:
     return {label: row.get(col, "") for col, label in COLUMNS}
 
 
+# ======================= 메일 발송 (Gmail) =======================
+MAIL_COLS = ["사업명", "수요기관", "발주시기", "예산금액(원)", "진행일자", "진행상태", "발주계획번호"]
+G2B_HOME = "https://www.g2b.go.kr/"
+
+
+def record_id(r: dict) -> str:
+    return r.get("발주계획번호") or f"{r.get('사업명', '')}|{r.get('수요기관', '')}"
+
+
+def load_seen(path: str) -> set[str]:
+    try:
+        return set(json.loads(Path(path).read_text(encoding="utf-8")))
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def save_seen(path: str, ids: set[str]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(sorted(ids), ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def build_mail(records: list[dict], period: str, order_range: str, keywords: list[str],
+               sender: str, to_addrs: list[str]) -> EmailMessage:
+    n = len(records)
+    today = datetime.now().strftime("%Y-%m-%d")
+    subject = f"[나라장터] {BUSINESS_TYPE} 경로당 {SEARCH_TYPE} 발주예정 신규 {n}건 ({today})"
+    summary = [
+        f"검색유형: {SEARCH_TYPE} / 업무구분: {BUSINESS_TYPE}",
+        f"발주시기: {order_range} (앞으로 {ORDER_MONTHS}개월 내 발주 예정)",
+        f"조회 범위(진행일자/등록일): {period or '-'}",
+        f"사업명 검색어: {', '.join(keywords)}",
+        f"신규 건수: {n}건",
+    ]
+    e = html.escape
+    th = "border:1px solid #ccc;padding:4px 8px;background:#f2f4f7;white-space:nowrap"
+    td = "border:1px solid #ccc;padding:4px 8px"
+    head = "".join(f'<th style="{th}">{e(c)}</th>' for c in MAIL_COLS)
+    body_rows = "".join(
+        "<tr>" + "".join(f'<td style="{td}">{e(str(r.get(c, "")))}</td>' for c in MAIL_COLS) + "</tr>"
+        for r in records
+    )
+    table = (f'<table style="border-collapse:collapse;font-size:13px"><tr>{head}</tr>{body_rows}</table>'
+             if records else "<p>신규 건이 없습니다.</p>")
+    html_body = (
+        "<div style=\"font-family:'Malgun Gothic',sans-serif;font-size:14px\">"
+        + "".join(f"<div>{e(x)}</div>" for x in summary)
+        + f"<br>{table}<br>"
+        + f'<div>나라장터: <a href="{G2B_HOME}">{G2B_HOME}</a> (발주 &gt; 발주목록에서 발주계획번호로 검색)</div>'
+        + "</div>"
+    )
+    text_lines = summary + [""] + [
+        f"- [{r.get('발주시기', '')}] {r.get('사업명', '')} / {r.get('수요기관', '')} ({r.get('발주계획번호', '')})"
+        for r in records
+    ] + ["", f"나라장터: {G2B_HOME} (발주 > 발주목록에서 발주계획번호로 검색)"]
+
+    msg = EmailMessage()
+    msg["Subject"], msg["From"], msg["To"] = subject, sender, ", ".join(to_addrs)
+    msg.set_content("\n".join(text_lines))
+    msg.add_alternative(html_body, subtype="html")
+    if records:
+        buf = io.StringIO()
+        fields = [label for _, label in COLUMNS] + ["검색어", "수집일시"]
+        w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(records)
+        msg.add_attachment(
+            ("\ufeff" + buf.getvalue()).encode("utf-8"),
+            maintype="text", subtype="csv",
+            filename=f"g2b_orderplan_{datetime.now().strftime('%Y%m%d')}.csv",
+        )
+    return msg
+
+
+def send_gmail(msg: EmailMessage) -> None:
+    user = os.environ.get("GMAIL_USER", "").strip()
+    pw = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+    if not user or not pw:
+        raise RuntimeError("환경변수 GMAIL_USER / GMAIL_APP_PASSWORD 가 필요합니다.")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as smtp:
+        smtp.login(user, pw)
+        smtp.send_message(msg)
+
+
 # ======================= 메인 =======================
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="나라장터 발주계획 크롤러")
@@ -459,11 +584,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dump-xhr", action="store_true", help="JSON 응답(XHR) 저장")
     ap.add_argument("--inspect", action="store_true", help="입력요소 구조만 저장하고 종료")
     ap.add_argument("--keywords", nargs="+", default=KEYWORDS, help="사업명 검색어(복수)")
-    ap.add_argument("--months", type=int, default=PERIOD_MONTHS, choices=[1, 3, 6],
-                    help="기간 버튼(최근 N개월)")
+    ap.add_argument("--order-months", type=int, default=ORDER_MONTHS,
+                    help="발주시기: 이번 달부터 앞으로 N개월 이내 (기본 6)")
+    ap.add_argument("--reg-months", type=int, default=REG_MONTHS,
+                    help="진행일자(등록일) 조회범위: 최근 N개월 (기본 12)")
     ap.add_argument("--start-url", default=None, help="발주목록 URL을 알면 직접 이동")
     ap.add_argument("--out", default="output", help="결과 폴더")
     ap.add_argument("--slow-mo", type=int, default=0, help="동작 지연(ms), 디버깅용")
+    ap.add_argument("--send-mail", action="store_true", help="결과를 Gmail로 발송")
+    ap.add_argument("--to", default=None, help="수신자(쉼표 구분). 미지정 시 MAIL_TO 환경변수")
+    ap.add_argument("--seen-file", default=None, help="발송 이력 파일(예: state/seen_plans.json). 지정 시 신규 건만 발송")
+    ap.add_argument("--send-empty", action="store_true", help="신규 건이 없어도 '없음' 메일 발송")
     return ap.parse_args()
 
 
@@ -471,9 +602,15 @@ def main() -> int:
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    log(f"조건: {SEARCH_TYPE} / {BUSINESS_TYPE} / 최근 {args.months}개월(진행일자) / 검색어 {args.keywords}")
+    today = date.today()
+    end_ym = add_months(today, args.order_months)
+    ym_from, ym_to = (today.year, today.month), (end_ym.year, end_ym.month)
+    order_range = f"{ym_from[0]}/{ym_from[1]:02d} ~ {ym_to[0]}/{ym_to[1]:02d}"
+    log(f"조건: {SEARCH_TYPE} / {BUSINESS_TYPE} / 발주시기 {order_range} / "
+        f"등록일 최근 {args.reg_months}개월 / 검색어 {args.keywords}")
 
     merged: dict[str, dict] = {}
+    period = ""
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=not args.headed,
@@ -508,7 +645,7 @@ def main() -> int:
                 close_popups(page)
                 set_search_type(page)
                 set_business_type(page)
-                set_period(page, args.months)
+                period = set_period(page, args.reg_months)
                 snap(page, out / "debug", f"02_filters_{idx}", args.debug)
                 run_search(page, kw)
                 set_page_size(page)
@@ -518,11 +655,16 @@ def main() -> int:
 
                 raw = collect_pages(page, total) if total != 0 else []
                 kept = 0
+                out_of_range = 0
                 for row in raw:
                     # 서버 필터 누락 방지: 업무구분·키워드 재검증
                     if row.get("prcmBsneSeNm") != BUSINESS_TYPE:
                         continue
                     if norm(kw) not in norm(row.get("bizNm", "")):
+                        continue
+                    ym = ym_of(row.get("oderYymm", ""))  # 발주시기: 앞으로 N개월 이내만
+                    if ym is None or not (ym_from <= ym <= ym_to):
+                        out_of_range += 1
                         continue
                     key = row.get("oderPlanNo") or "|".join(row.values())
                     rec = to_record(row)
@@ -532,7 +674,7 @@ def main() -> int:
                         rec["검색어"] = [kw]
                         merged[key] = rec
                     kept += 1
-                log(f"  수집 {len(raw)}행 중 조건 일치 {kept}건")
+                log(f"  수집 {len(raw)}행 중 조건 일치 {kept}건 (발주시기 범위 밖/미기재 {out_of_range}건 제외)")
                 time.sleep(PAUSE)
         except Exception as e:  # noqa: BLE001
             log(f"오류: {str(e)[:400]}")
@@ -543,7 +685,7 @@ def main() -> int:
             return 2
         browser.close()
 
-    records = sorted(merged.values(), key=lambda r: r.get("진행일자", ""), reverse=True)
+    records = sorted(merged.values(), key=lambda r: (r.get("발주시기", ""), r.get("사업명", "")))
     now = datetime.now()
     for r in records:
         r["검색어"] = ", ".join(dict.fromkeys(r["검색어"]))
@@ -562,10 +704,31 @@ def main() -> int:
             w.writerows(records)
         log(f"완료: 중복 제거 후 {len(records)}건 → {csv_path}")
         for r in records[:30]:
-            log(f"  · [{r['진행일자']}] {r['사업명']} / {r['수요기관']} ({r['발주계획번호']})")
+            log(f"  · [발주 {r['발주시기']}] {r['사업명']} / {r['수요기관']} ({r['발주계획번호']})")
     else:
         log("완료: 조건에 맞는 건이 없습니다.")
-    return 0
+
+    rc = 0
+    if args.send_mail:
+        try:
+            to_addrs = [a.strip() for a in (args.to or os.environ.get("MAIL_TO", "")).split(",") if a.strip()]
+            if not to_addrs:
+                raise RuntimeError("수신자가 없습니다. --to 또는 MAIL_TO 환경변수를 지정하세요.")
+            seen = load_seen(args.seen_file) if args.seen_file else set()
+            fresh = [r for r in records if record_id(r) not in seen]
+            log(f"메일 대상: 신규 {len(fresh)}건 (전체 {len(records)}건, 기발송 {len(records) - len(fresh)}건)")
+            if fresh or args.send_empty:
+                sender = os.environ.get("GMAIL_USER", "").strip()
+                send_gmail(build_mail(fresh, period, order_range, args.keywords, sender, to_addrs))
+                log(f"메일 발송 완료 → {', '.join(to_addrs)}")
+            else:
+                log("신규 건이 없어 메일을 발송하지 않습니다.")
+            if args.seen_file:  # 발송 성공 후에만 이력 갱신
+                save_seen(args.seen_file, seen | {record_id(r) for r in records})
+        except Exception as e:  # noqa: BLE001
+            log(f"메일 발송 실패: {str(e)[:300]}")
+            rc = 3
+    return rc
 
 
 if __name__ == "__main__":
