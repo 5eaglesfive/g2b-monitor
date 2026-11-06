@@ -102,23 +102,86 @@ def first_visible(loc):
     return None
 
 
-def click_text(page: Page, text: str, exact: bool = True) -> bool:
-    """라디오/체크박스/탭/버튼/라벨/텍스트 순으로 찾아 첫 번째 보이는 요소를 클릭"""
-    candidates = [
-        page.get_by_role("radio", name=text, exact=exact),
-        page.get_by_role("checkbox", name=text, exact=exact),
-        page.get_by_role("tab", name=text, exact=exact),
-        page.get_by_role("button", name=text, exact=exact),
-        page.get_by_label(text, exact=exact),
-        page.get_by_text(text, exact=exact),
-    ]
-    for loc in candidates:
-        el = first_visible(loc)
-        if el:
-            el.click()
-            page.wait_for_timeout(300)
+GRID_EXCL = "not(ancestor::*[contains(@class,'w2grid')])"  # 결과 그리드 안의 셀은 제외
+
+
+def safe_click(el) -> bool:
+    for fn in (
+        lambda: el.click(timeout=3000),
+        lambda: el.click(timeout=2000, force=True),
+        lambda: el.evaluate("e => e.click()"),
+    ):
+        try:
+            fn()
             return True
+        except Exception:  # noqa: BLE001
+            continue
     return False
+
+
+def click_text(page: Page, text: str, exact: bool = True) -> bool:
+    """검색 조건 영역의 버튼/라벨/선택상자에서 text를 찾아 클릭 (결과 그리드 셀은 제외)"""
+    cmp = f"normalize-space(.)='{text}'" if exact else f"contains(normalize-space(.),'{text}')"
+    strategies = [
+        ("button", f"xpath=//*[(self::button or self::a or @role='tab' or @role='radio' "
+                   f"or @role='button') and {cmp} and {GRID_EXCL}]"),
+        ("label", f"xpath=//label[{cmp} and {GRID_EXCL}]"),
+        ("text", f"xpath=//*[normalize-space(text())='{text}' and {GRID_EXCL}]"),
+    ]
+    for name, xp in strategies:
+        el = first_visible(page.locator(xp))
+        if el and safe_click(el):
+            page.wait_for_timeout(300)
+            log(f"  v '{text}' 클릭 ({name})")
+            return True
+    # <select> 옵션 방식
+    try:
+        for sel in page.locator("select").all():
+            opts = [o.strip() for o in sel.locator("option").all_inner_texts()]
+            if text in opts:
+                sel.select_option(label=text, force=True)
+                log(f"  v '{text}' 선택 (select)")
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+INSPECT_JS = r"""
+() => {
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const clean = t => (t || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  const out = [];
+  document.querySelectorAll(
+    'input, select, textarea, button, label, a, [role="tab"], [role="radio"], [role="checkbox"]'
+  ).forEach(el => {
+    if (el.closest('[class*="w2grid"]')) return;
+    const r = el.getBoundingClientRect();
+    out.push({
+      tag: el.tagName.toLowerCase(), type: el.type || '', id: el.id || '',
+      cls: (el.className && el.className.toString ? el.className.toString() : '').slice(0, 80),
+      text: clean(el.innerText || el.value || ''), title: el.title || '',
+      forAttr: el.htmlFor || '', checked: !!el.checked, visible: vis(el),
+      x: Math.round(r.x), y: Math.round(r.y)
+    });
+  });
+  return out.filter(o => o.visible || o.type === 'radio' || o.type === 'checkbox')
+            .sort((a, b) => (a.y - b.y) || (a.x - b.x));
+}
+"""
+
+
+def inspect_form(page: Page, out: Path) -> None:
+    """검색 조건 영역의 입력 요소 구조를 JSON으로 저장 (선택자 맞춤용)"""
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        items = page.evaluate(INSPECT_JS)
+        (out / "form_inspect.json").write_text(
+            json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        log(f"  form_inspect.json 저장 ({len(items)}개 요소)")
+    except Exception as e:  # noqa: BLE001
+        log(f"  form_inspect 실패: {e}")
 
 
 def input_after_label(page: Page, labels: list[str], nth: int = 1):
@@ -371,6 +434,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--headed", action="store_true", help="브라우저 창 표시")
     ap.add_argument("--debug", action="store_true", help="단계별 스크린샷/HTML 저장")
     ap.add_argument("--dump-xhr", action="store_true", help="JSON 응답(XHR) 저장")
+    ap.add_argument("--inspect", action="store_true", help="발주목록 화면의 입력요소 구조만 저장하고 종료")
     ap.add_argument("--keywords", nargs="+", default=KEYWORDS, help="사업명 검색어(복수)")
     ap.add_argument("--months", type=int, default=MONTHS, help="오늘부터 N개월")
     ap.add_argument("--start-url", default=None, help="발주게시판 URL을 알고 있으면 직접 이동")
@@ -411,6 +475,11 @@ def main() -> int:
         try:
             open_board(page, args.start_url)
             snap(page, out / "debug", "01_board", args.debug)
+            if args.inspect:
+                inspect_form(page, out / "debug")
+                snap(page, out / "debug", "form_inspect", True)
+                browser.close()
+                return 0
 
             for idx, kw in enumerate(args.keywords, 1):
                 log(f"[{idx}/{len(args.keywords)}] 검색어: '{kw}'")
@@ -428,9 +497,10 @@ def main() -> int:
                         merged[key] = rec
                 time.sleep(PAUSE)
         except Exception as e:  # noqa: BLE001
-            log(f"오류: {e}")
+            log(f"오류: {str(e)[:400]}")
             describe_page(page)
             snap(page, out / "debug", "error", True)
+            inspect_form(page, out / "debug")
             browser.close()
             return 2
         browser.close()
