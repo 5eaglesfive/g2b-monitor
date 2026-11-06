@@ -44,7 +44,8 @@ DATE_FMT = "%Y%m%d"  # 날짜 입력칸에 타이핑할 형식 (마스크가 자
 
 # ======================= 화면 설정 (개편 시 여기만 수정) =======================
 BASE_URL = "https://www.g2b.go.kr/"
-MENU_PATH = ["발주", "발주게시판"]                    # 상단 메뉴 경로
+MENU_PATH = ["발주", "발주목록"]                      # 상단 메뉴 경로
+SUB_MENU_NAMES = ["발주목록", "발주게시판"]            # 하위 메뉴 후보(순서대로 시도)
 DATE_LABELS = ["진행일자", "발주(예정)시기", "조회기간"]  # 날짜 입력칸 앞 라벨(순서대로 시도)
 NAME_LABELS = ["사업명", "발주계획명", "공고명"]        # 사업명 입력칸 앞 라벨
 SEARCH_BUTTON_TEXTS = ["검색", "조회"]
@@ -194,7 +195,7 @@ def dismiss_popups(page: Page) -> None:
                 break
 
 
-BLOCK_HINTS = ["access denied", "forbidden", "접근이 제한", "접근 제한", "해외", "비정상", "차단"]
+BLOCK_HINTS = ["access denied", "forbidden", "접근이 제한", "접근 제한"]
 
 
 def find_text(page: Page, text: str, wait_s: float = 20, exact: bool = True):
@@ -255,13 +256,20 @@ def open_board(page: Page, start_url: str | None) -> None:
         )
     top.hover()
     page.wait_for_timeout(600)
-    sub = find_text(page, MENU_PATH[1], 3)
+    sub = None
+    for name in SUB_MENU_NAMES:
+        sub = find_text(page, name, 3)
+        if sub:
+            break
     if not sub:
         top.click()
         page.wait_for_timeout(600)
-        sub = find_text(page, MENU_PATH[1], 5)
+        for name in SUB_MENU_NAMES:
+            sub = find_text(page, name, 5)
+            if sub:
+                break
     if not sub:
-        raise RuntimeError(f"하위 메뉴 '{MENU_PATH[1]}'를 찾지 못했습니다.")
+        raise RuntimeError(f"하위 메뉴 {SUB_MENU_NAMES} 중 어느 것도 찾지 못했습니다.")
     sub.click()
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
