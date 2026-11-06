@@ -1,36 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-나라장터(https://www.g2b.go.kr) 발주 > 발주게시판 크롤러
+나라장터(https://www.g2b.go.kr) 발주 > 발주목록 크롤러
 
 조건
   - 검색유형 : 발주계획
-  - 업무구분 : 일반용역
+  - 업무구분 : 일반용역   (상세조건 영역의 체크박스)
   - 사업명   : "스마트경로당" "스마트 경로당" "경로당" "경로당 구축" (각각 검색 후 병합·중복제거)
-  - 진행일자 : 오늘 ~ 오늘+6개월
+  - 진행일자 : 화면의 기간 버튼 '6개월' (오늘 포함 최근 6개월, 오늘 기준 6개월 전 ~ 오늘)
 
 설치
   pip install playwright
   playwright install chromium
 
 실행
-  python g2b_orderplan_crawler.py --headed --debug     # 최초 1회: 화면 보면서 확인
-  python g2b_orderplan_crawler.py                       # 이후: 백그라운드 실행
-  python g2b_orderplan_crawler.py --dump-xhr            # 내부 조회 API(XHR) 응답 저장 (구조 파악용)
+  python g2b_orderplan_crawler.py --headed --debug   # 화면 보며 확인
+  python g2b_orderplan_crawler.py                    # 백그라운드 실행
+  python g2b_orderplan_crawler.py --inspect          # 입력요소 구조만 저장(개편 대응용)
 
-※ 차세대 나라장터는 SPA(WebSquare)라서 화면 구조가 바뀌면 아래 [화면 설정] 값만 고치면 됩니다.
-※ 사이트 부하를 줄이기 위해 호출 간격을 두었습니다. 상시 운영은 조달청 Open API를 권장합니다.
+※ 선택자는 2026-11 화면(업로드 HTML)에서 확인한 id 기준입니다. 개편되면 [화면 설정]만 수정하세요.
+※ 진행일자 입력칸은 읽기 전용(달력/기간버튼 선택식)이라 1·3·6개월 버튼만 지원합니다.
 """
 from __future__ import annotations
 
 import argparse
-import calendar
 import csv
 import json
 import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
@@ -39,113 +38,62 @@ from playwright.sync_api import Page, sync_playwright
 SEARCH_TYPE = "발주계획"
 BUSINESS_TYPE = "일반용역"
 KEYWORDS = ["스마트경로당", "스마트 경로당", "경로당", "경로당 구축"]
-MONTHS = 6
-DATE_FMT = "%Y%m%d"  # 날짜 입력칸에 타이핑할 형식 (마스크가 자동으로 YYYY/MM/DD로 바꿔줌)
+PERIOD_MONTHS = 6          # 1 / 3 / 6 (화면의 기간 버튼)
+PAGE_SIZE = "100"          # 화면의 표시 건수 (10/30/50/100)
 
 # ======================= 화면 설정 (개편 시 여기만 수정) =======================
 BASE_URL = "https://www.g2b.go.kr/"
-MENU_PATH = ["발주", "발주목록"]                      # 상단 메뉴 경로
-SUB_MENU_NAMES = ["발주목록", "발주게시판"]            # 하위 메뉴 후보(순서대로 시도)
-DATE_LABELS = ["진행일자", "발주(예정)시기", "조회기간"]  # 날짜 입력칸 앞 라벨(순서대로 시도)
-NAME_LABELS = ["사업명", "발주계획명", "공고명"]        # 사업명 입력칸 앞 라벨
-SEARCH_BUTTON_TEXTS = ["검색", "조회"]
-NEXT_PAGE_SELECTORS = [
-    '[class*="pageList_next"]',
-    'a[title*="다음"]',
-    'button[title*="다음"]',
-    'a:has-text("다음")',
+MENU_PATH = ["발주", "발주목록"]
+SUB_MENU_NAMES = ["발주목록", "발주게시판"]
+
+SEL = {
+    "search_type_prefix": "mf_wfm_container_radSrchTy_input_",       # 라디오: 발주계획 등
+    "biz_type_prefix": "mf_wfm_container_chkRqdcBsneSeCd_input_",    # 체크박스: 업무구분
+    "period_radio": 'input[id*="btnMnth_input_"]',                   # 라디오: 1/3/6개월
+    "date_from": 'input[id$="ibxStrDay"]',
+    "date_to": 'input[id$="ibxEndDay"]',
+    "biz_name": "#mf_wfm_container_txtBizNm",                        # 사업명 입력
+    "search_btn": "#mf_wfm_container_btnS0001",                      # 검색 버튼
+    "detail_toggle": 'input[id$="btnSearchToggle"]',                 # 상세조건 열기/닫기
+    "page_size": "#mf_wfm_container_sbxRecordCountPerPage",
+    "page_apply": "#mf_wfm_container_btnAply",
+    "pager": "#mf_wfm_container_pagelist",
+    "pager_next": "#mf_wfm_container_pagelist_next_btn a",
+    "popup_close": "button.w2window_close, input.w2trigger.btn_cm.close",
+}
+
+# 결과 그리드 col_id → 출력 컬럼명
+COLUMNS = [
+    ("oderPlanNo", "발주계획번호"),
+    ("prcmBsneSeNm", "업무구분"),
+    ("pbancSeYnNm", "내외자"),
+    ("bizNm", "사업명"),
+    ("oderInstUntyGrpNm", "수요기관"),
+    ("tkcgDeptNm", "담당부서"),
+    ("picNm", "담당자"),
+    ("prcsYmd", "진행일자"),
+    ("oderPlanPgstNm", "진행상태"),
+    ("oderYymm", "발주시기"),
+    ("bgtSumAmt", "예산금액(원)"),
+    ("bfSpecRfrnYn", "사전규격참조"),
 ]
-CLOSE_POPUP_TEXTS = ["닫기", "오늘 하루 보지 않기", "확인"]
-MAX_PAGES = 100
+
+MAX_PAGES = 200
 PAUSE = 1.2  # 동작 간 대기(초)
 
-EXTRACT_JS = r"""
+GRID_JS = r"""
 () => {
-  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const clean = t => (t || '').replace(/\s+/g, ' ').trim();
-  const rows = [...document.querySelectorAll('tr')]
-    .filter(vis)
-    .map(tr => [...tr.querySelectorAll(':scope > td')].map(td => clean(td.innerText)))
-    .filter(c => c.length >= 4 && c.some(x => x));
-  const heads = [...document.querySelectorAll('th, [class*="grid_head"] td')]
-    .filter(vis).map(h => clean(h.innerText)).filter(Boolean);
-  return {headers: heads, rows: rows};
+  const re = /^mf_wfm_container_gridView1_cell_(\d+)_(\d+)$/;
+  const rows = {};
+  document.querySelectorAll('td[col_id]').forEach(td => {
+    const m = re.exec(td.id || '');
+    if (!m) return;
+    const r = (rows[m[1]] = rows[m[1]] || {});
+    r[td.getAttribute('col_id')] = (td.innerText || '').replace(/\s+/g, ' ').trim();
+  });
+  return Object.keys(rows).map(Number).sort((a, b) => a - b).map(k => rows[k]);
 }
 """
-
-
-# ======================= 유틸 =======================
-def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def norm(s: str) -> str:
-    """공백 제거 정규화 ('스마트 경로당' == '스마트경로당')"""
-    return re.sub(r"\s+", "", s or "")
-
-
-def add_months(d: date, n: int) -> date:
-    y, m = divmod(d.month - 1 + n, 12)
-    y += d.year
-    m += 1
-    return date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
-
-
-def first_visible(loc):
-    try:
-        for i in range(loc.count()):
-            el = loc.nth(i)
-            if el.is_visible():
-                return el
-    except Exception:
-        pass
-    return None
-
-
-GRID_EXCL = "not(ancestor::*[contains(@class,'w2grid')])"  # 결과 그리드 안의 셀은 제외
-
-
-def safe_click(el) -> bool:
-    for fn in (
-        lambda: el.click(timeout=3000),
-        lambda: el.click(timeout=2000, force=True),
-        lambda: el.evaluate("e => e.click()"),
-    ):
-        try:
-            fn()
-            return True
-        except Exception:  # noqa: BLE001
-            continue
-    return False
-
-
-def click_text(page: Page, text: str, exact: bool = True) -> bool:
-    """검색 조건 영역의 버튼/라벨/선택상자에서 text를 찾아 클릭 (결과 그리드 셀은 제외)"""
-    cmp = f"normalize-space(.)='{text}'" if exact else f"contains(normalize-space(.),'{text}')"
-    strategies = [
-        ("button", f"xpath=//*[(self::button or self::a or @role='tab' or @role='radio' "
-                   f"or @role='button') and {cmp} and {GRID_EXCL}]"),
-        ("label", f"xpath=//label[{cmp} and {GRID_EXCL}]"),
-        ("text", f"xpath=//*[normalize-space(text())='{text}' and {GRID_EXCL}]"),
-    ]
-    for name, xp in strategies:
-        el = first_visible(page.locator(xp))
-        if el and safe_click(el):
-            page.wait_for_timeout(300)
-            log(f"  v '{text}' 클릭 ({name})")
-            return True
-    # <select> 옵션 방식
-    try:
-        for sel in page.locator("select").all():
-            opts = [o.strip() for o in sel.locator("option").all_inner_texts()]
-            if text in opts:
-                sel.select_option(label=text, force=True)
-                log(f"  v '{text}' 선택 (select)")
-                return True
-    except Exception:  # noqa: BLE001
-        pass
-    return False
-
 
 INSPECT_JS = r"""
 () => {
@@ -171,41 +119,49 @@ INSPECT_JS = r"""
 """
 
 
-def inspect_form(page: Page, out: Path) -> None:
-    """검색 조건 영역의 입력 요소 구조를 JSON으로 저장 (선택자 맞춤용)"""
-    out.mkdir(parents=True, exist_ok=True)
+# ======================= 유틸 =======================
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def norm(s: str) -> str:
+    """공백 제거 정규화 ('스마트 경로당' == '스마트경로당')"""
+    return re.sub(r"\s+", "", s or "")
+
+
+def first_visible(loc):
     try:
-        items = page.evaluate(INSPECT_JS)
-        (out / "form_inspect.json").write_text(
-            json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8"
-        )
-        log(f"  form_inspect.json 저장 ({len(items)}개 요소)")
-    except Exception as e:  # noqa: BLE001
-        log(f"  form_inspect 실패: {e}")
-
-
-def input_after_label(page: Page, labels: list[str], nth: int = 1):
-    """라벨 텍스트 뒤에 나오는 n번째 텍스트 입력칸"""
-    for label in labels:
-        xp = (
-            f"xpath=(//*[normalize-space(text())='{label}']"
-            f"/following::input[not(@type='hidden') and not(@type='checkbox') and not(@type='radio')])[{nth}]"
-        )
-        loc = page.locator(xp)
-        try:
-            if loc.count() and loc.first.is_visible():
-                return loc.first
-        except Exception:
-            continue
+        for i in range(loc.count()):
+            el = loc.nth(i)
+            if el.is_visible():
+                return el
+    except Exception:  # noqa: BLE001
+        pass
     return None
 
 
-def type_value(el, value: str) -> None:
-    el.click()
-    el.press("Control+A")
-    el.press("Delete")
-    el.type(value, delay=30)
-    el.press("Tab")
+def safe_click(el) -> bool:
+    if el is None:
+        return False
+    for fn in (
+        lambda: el.click(timeout=3000),
+        lambda: el.click(timeout=2000, force=True),
+        lambda: el.evaluate("e => e.click()"),
+    ):
+        try:
+            fn()
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def settle(page: Page, extra: float = PAUSE) -> None:
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:  # noqa: BLE001
+        pass
+    page.wait_for_timeout(int(extra * 1000))
 
 
 def snap(page: Page, out: Path, name: str, enabled: bool) -> None:
@@ -217,6 +173,29 @@ def snap(page: Page, out: Path, name: str, enabled: bool) -> None:
         (out / f"{name}.html").write_text(page.content(), encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         log(f"스냅샷 실패({name}): {e}")
+
+
+def describe_page(page: Page) -> str:
+    try:
+        body = page.evaluate("() => (document.body ? document.body.innerText : '')")
+    except Exception:  # noqa: BLE001
+        body = ""
+    flat = re.sub(r"\s+", " ", body)
+    log(f"  페이지 제목: {page.title()!r} / URL: {page.url}")
+    log(f"  본문 앞부분: {flat[:300]!r}")
+    return flat
+
+
+def inspect_form(page: Page, out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        items = page.evaluate(INSPECT_JS)
+        (out / "form_inspect.json").write_text(
+            json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        log(f"  form_inspect.json 저장 ({len(items)}개 요소)")
+    except Exception as e:  # noqa: BLE001
+        log(f"  form_inspect 실패: {e}")
 
 
 def attach_xhr_dump(page: Page, out_dir: Path) -> None:
@@ -245,24 +224,30 @@ def attach_xhr_dump(page: Page, out_dir: Path) -> None:
 
 
 # ======================= 화면 조작 =======================
-def dismiss_popups(page: Page) -> None:
-    for t in CLOSE_POPUP_TEXTS:
-        for _ in range(3):
-            el = first_visible(page.get_by_text(t, exact=True))
-            if not el:
-                break
+def close_popups(page: Page, rounds: int = 4) -> int:
+    """공지사항 팝업(여러 개)을 모두 닫는다. 팝업이 클릭을 가로채므로 조건 입력 전에 필수."""
+    closed = 0
+    for _ in range(rounds):
+        n = 0
+        els = page.locator(SEL["popup_close"])
+        for i in range(els.count()):
+            el = els.nth(i)
             try:
-                el.click(timeout=2000)
-                page.wait_for_timeout(300)
+                if el.is_visible():
+                    el.click(timeout=2000)
+                    n += 1
+                    page.wait_for_timeout(300)
             except Exception:  # noqa: BLE001
-                break
-
-
-BLOCK_HINTS = ["access denied", "forbidden", "접근이 제한", "접근 제한"]
+                pass
+        closed += n
+        if n == 0:
+            break
+    if closed:
+        log(f"  공지 팝업 {closed}개 닫음")
+    return closed
 
 
 def find_text(page: Page, text: str, wait_s: float = 20, exact: bool = True):
-    """모든 프레임에서 텍스트/링크/버튼을 최대 wait_s초 동안 폴링하며 찾는다."""
     end = time.time() + wait_s
     while True:
         for fr in page.frames:
@@ -279,153 +264,191 @@ def find_text(page: Page, text: str, wait_s: float = 20, exact: bool = True):
         page.wait_for_timeout(1000)
 
 
-def describe_page(page: Page) -> str:
-    """현재 페이지 상태를 로그로 남긴다(차단/미렌더링 원인 파악용)."""
-    try:
-        body = page.evaluate("() => (document.body ? document.body.innerText : '')")
-    except Exception:  # noqa: BLE001
-        body = ""
-    flat = re.sub(r"\s+", " ", body)
-    log(f"  페이지 제목: {page.title()!r} / URL: {page.url}")
-    log(f"  본문 앞부분: {flat[:300]!r}")
-    return flat
-
-
 def open_board(page: Page, start_url: str | None) -> None:
     page.goto(start_url or BASE_URL, wait_until="domcontentloaded", timeout=60000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except Exception:  # noqa: BLE001
-        pass
-    page.wait_for_timeout(3000)
-    dismiss_popups(page)
-    flat = describe_page(page)
-    if len(flat) < 50 or any(h in flat.lower() for h in BLOCK_HINTS):
-        log("  ! 화면이 비었거나 접속 차단/오류 페이지로 보입니다. (해외 IP 차단 가능성)")
-    if start_url:
-        return
-
-    top = find_text(page, MENU_PATH[0], 20)
-    if not top:  # 햄버거(전체메뉴) 뒤에 숨어 있는 경우
-        burger = find_text(page, "전체메뉴", 3)
-        if burger:
-            burger.click()
-            page.wait_for_timeout(800)
-            top = find_text(page, MENU_PATH[0], 5)
-    if not top:
-        raise RuntimeError(
-            f"상단 메뉴 '{MENU_PATH[0]}'를 찾지 못했습니다. "
-            "output/debug/error.png 와 위 '본문 앞부분' 로그를 확인하세요."
-        )
-    top.hover()
-    page.wait_for_timeout(600)
-    sub = None
-    for name in SUB_MENU_NAMES:
-        sub = find_text(page, name, 3)
-        if sub:
-            break
-    if not sub:
-        top.click()
+    settle(page, 3)
+    close_popups(page)
+    describe_page(page)
+    if not start_url:
+        top = find_text(page, MENU_PATH[0], 20)
+        if not top:
+            burger = find_text(page, "전체메뉴", 3)
+            if burger:
+                burger.click()
+                page.wait_for_timeout(800)
+                top = find_text(page, MENU_PATH[0], 5)
+        if not top:
+            raise RuntimeError(f"상단 메뉴 '{MENU_PATH[0]}'를 찾지 못했습니다.")
+        top.hover()
         page.wait_for_timeout(600)
+        sub = None
         for name in SUB_MENU_NAMES:
-            sub = find_text(page, name, 5)
+            sub = find_text(page, name, 3)
             if sub:
                 break
-    if not sub:
-        raise RuntimeError(f"하위 메뉴 {SUB_MENU_NAMES} 중 어느 것도 찾지 못했습니다.")
-    sub.click()
-    try:
-        page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:  # noqa: BLE001
-        pass
-    page.wait_for_timeout(1500)
+        if not sub:
+            top.click()
+            page.wait_for_timeout(600)
+            for name in SUB_MENU_NAMES:
+                sub = find_text(page, name, 5)
+                if sub:
+                    break
+        if not sub:
+            raise RuntimeError(f"하위 메뉴 {SUB_MENU_NAMES}를 찾지 못했습니다.")
+        sub.click()
+    settle(page, 2.5)
+    close_popups(page)  # 발주목록 화면의 공지 팝업은 화면 진입 후 열린다
+    if page.locator(SEL["biz_name"]).count() == 0:
+        raise RuntimeError("발주목록 검색 화면(사업명 입력칸)이 열리지 않았습니다.")
 
 
-def apply_filters(page: Page, keyword: str, d_from: date, d_to: date) -> None:
-    if not click_text(page, SEARCH_TYPE):
-        log(f"  ! 검색유형 '{SEARCH_TYPE}' 선택 요소를 찾지 못함")
-    if not click_text(page, BUSINESS_TYPE):
-        log(f"  ! 업무구분 '{BUSINESS_TYPE}' 선택 요소를 찾지 못함")
-
-    i_from = input_after_label(page, DATE_LABELS, 1)
-    i_to = input_after_label(page, DATE_LABELS, 2)
-    if i_from and i_to:
-        type_value(i_from, d_from.strftime(DATE_FMT))
-        type_value(i_to, d_to.strftime(DATE_FMT))
-    else:
-        log("  ! 진행일자 입력칸을 찾지 못함 (날짜 조건 미적용)")
-
-    i_name = input_after_label(page, NAME_LABELS, 1)
-    if not i_name:
-        raise RuntimeError("사업명 입력칸을 찾지 못했습니다. NAME_LABELS를 확인하세요.")
-    type_value(i_name, keyword)
+def option_input(page: Page, prefix: str, title: str):
+    loc = page.locator(f'input[id^="{prefix}"][title="{title}"]')
+    return loc.first if loc.count() else None
 
 
-def run_search(page: Page) -> None:
-    for t in SEARCH_BUTTON_TEXTS:
-        if click_text(page, t):
-            break
-    else:
-        raise RuntimeError("검색 버튼을 찾지 못했습니다.")
-    try:
-        page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:  # noqa: BLE001
-        pass
-    page.wait_for_timeout(int(PAUSE * 1000))
+def is_checked(inp) -> bool:
+    return bool(inp.evaluate("e => e.checked"))
 
 
-def go_next(page: Page, current: int) -> bool:
-    # 1) 다음 번호 링크  2) '다음' 버튼 (페이지 그룹 이동)
-    el = first_visible(page.get_by_role("link", name=str(current + 1), exact=True))
-    if el:
-        el.click()
-        page.wait_for_timeout(int(PAUSE * 1000))
+def click_option(page: Page, inp) -> bool:
+    """라디오/체크박스는 연결된 label을 클릭해야 화면 로직이 반응한다."""
+    iid = inp.get_attribute("id")
+    lab = first_visible(page.locator(f'label[for="{iid}"]'))
+    if lab and safe_click(lab):
+        page.wait_for_timeout(300)
         return True
-    for sel in NEXT_PAGE_SELECTORS:
-        el = first_visible(page.locator(sel))
-        if el:
-            cls = el.get_attribute("class") or ""
-            if "disabled" in cls or not el.is_enabled():
-                continue
-            el.click()
-            page.wait_for_timeout(int(PAUSE * 1000))
-            return True
-    return False
+    return safe_click(inp)
+
+
+def set_search_type(page: Page) -> None:
+    inp = option_input(page, SEL["search_type_prefix"], SEARCH_TYPE)
+    if not inp:
+        raise RuntimeError(f"검색유형 '{SEARCH_TYPE}' 라디오를 찾지 못했습니다.")
+    if not is_checked(inp):
+        click_option(page, inp)
+    log(f"  검색유형: {SEARCH_TYPE} ({'선택됨' if is_checked(inp) else '선택 실패'})")
+
+
+def set_business_type(page: Page) -> None:
+    prefix = SEL["biz_type_prefix"]
+    target = option_input(page, prefix, BUSINESS_TYPE)
+    if not target:
+        raise RuntimeError(f"업무구분 '{BUSINESS_TYPE}' 체크박스를 찾지 못했습니다.")
+    # 상세조건이 접혀 있으면 펼친다
+    lab = page.locator(f'label[for="{target.get_attribute("id")}"]')
+    if not first_visible(lab):
+        safe_click(first_visible(page.locator(SEL["detail_toggle"])))
+        page.wait_for_timeout(600)
+    for _ in range(2):  # 전체/다른 항목 해제 → 대상만 체크 (2회 확인)
+        for inp in page.locator(f'input[id^="{prefix}"]').all():
+            want = inp.get_attribute("title") == BUSINESS_TYPE
+            if is_checked(inp) != want:
+                click_option(page, inp)
+    states = {
+        inp.get_attribute("title"): is_checked(inp)
+        for inp in page.locator(f'input[id^="{prefix}"]').all()
+    }
+    checked = [k for k, v in states.items() if v]
+    log(f"  업무구분 체크 상태: {checked}")
+    if checked != [BUSINESS_TYPE]:
+        log("  ! 업무구분이 의도와 다르게 선택됨 (결과는 업무구분으로 재필터링됩니다)")
+
+
+def set_period(page: Page, months: int) -> None:
+    inp = page.locator(f'{SEL["period_radio"]}[title="{months}개월"]')
+    if not inp.count():
+        raise RuntimeError(f"기간 버튼 '{months}개월'을 찾지 못했습니다.")
+    inp = inp.first
+    if not is_checked(inp):
+        click_option(page, inp)
+    page.wait_for_timeout(500)
+    d1 = page.locator(SEL["date_from"]).first.input_value()
+    d2 = page.locator(SEL["date_to"]).first.input_value()
+    log(f"  진행일자: {d1} ~ {d2} ({months}개월)")
+
+
+def run_search(page: Page, keyword: str) -> None:
+    box = page.locator(SEL["biz_name"]).first
+    box.click()
+    box.fill(keyword)
+    btn = first_visible(page.locator(SEL["search_btn"]))
+    if not safe_click(btn):
+        raise RuntimeError("검색 버튼을 클릭하지 못했습니다.")
+    settle(page)
+
+
+def set_page_size(page: Page) -> None:
+    try:
+        sel = page.locator(SEL["page_size"]).first
+        if sel.input_value() != PAGE_SIZE:
+            sel.select_option(label=PAGE_SIZE)
+            safe_click(first_visible(page.locator(SEL["page_apply"])))
+            settle(page)
+    except Exception as e:  # noqa: BLE001
+        log(f"  표시 건수 변경 실패(무시): {str(e)[:120]}")
+
+
+def get_total(page: Page) -> int | None:
+    try:
+        body = page.evaluate("() => document.body.innerText")
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"발주요청목록\s*전체\s*([\d,]+)\s*건", body) or re.search(r"전체\s*([\d,]+)\s*건", body)
+    return int(m.group(1).replace(",", "")) if m else None
 
 
 # ======================= 수집 =======================
-def collect_pages(page: Page, keyword: str) -> list[dict]:
-    kw = norm(keyword)
-    out: list[dict] = []
-    seen_sig: set[str] = set()
-    for p in range(1, MAX_PAGES + 1):
-        data = page.evaluate(EXTRACT_JS)
-        rows, heads = data["rows"], list(dict.fromkeys(data["headers"]))
-        sig = json.dumps(rows[:3], ensure_ascii=False)
-        if not rows or sig in seen_sig:
+def grid_rows(page: Page) -> list[dict]:
+    rows = page.evaluate(GRID_JS)
+    return [r for r in rows if r.get("bizNm") or r.get("oderPlanNo")]
+
+
+def signature(rows: list[dict]) -> tuple:
+    if not rows:
+        return ()
+    return (rows[0].get("oderPlanNo"), rows[-1].get("oderPlanNo"), len(rows))
+
+
+def current_page(page: Page) -> int:
+    try:
+        txt = page.locator(f'{SEL["pager"]} a.w2pageList_label_selected').first.inner_text()
+        return int(re.sub(r"\D", "", txt) or 1)
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+def go_next(page: Page, cur: int) -> bool:
+    a = first_visible(
+        page.locator(f'{SEL["pager"]} a.w2pageList_control_label[index="{cur + 1}"]')
+    ) or first_visible(page.locator(SEL["pager_next"]))
+    return safe_click(a)
+
+
+def collect_pages(page: Page, expected_total: int | None) -> list[dict]:
+    raw: list[dict] = []
+    seen: set[tuple] = set()
+    for _ in range(MAX_PAGES):
+        rows = grid_rows(page)
+        sig = signature(rows)
+        if not rows or sig in seen:
             break
-        seen_sig.add(sig)
-
-        for cells in rows:
-            if kw not in norm(" ".join(cells)):  # 서버 필터 누락 방지: 키워드 재검증
-                continue
-            rec = (
-                dict(zip(heads, cells))
-                if len(heads) == len(cells)
-                else {f"col{i + 1}": v for i, v in enumerate(cells)}
-            )
-            out.append(rec)
-        log(f"  - {p}페이지: 행 {len(rows)}개 중 누적 매칭 {len(out)}건")
-        if not go_next(page, p):
+        seen.add(sig)
+        raw.extend(rows)
+        cur = current_page(page)
+        log(f"  - {cur}페이지: {len(rows)}행 (누적 {len(raw)}/{expected_total or '?'})")
+        if expected_total is not None and len(raw) >= expected_total:
             break
-    return out
+        if not go_next(page, cur):
+            break
+        end = time.time() + 12  # 그리드가 바뀔 때까지 대기
+        while time.time() < end and signature(grid_rows(page)) == sig:
+            page.wait_for_timeout(400)
+    return raw
 
 
-def record_key(rec: dict) -> str:
-    vals = [str(v) for v in rec.values()]
-    if vals and vals[0].isdigit():  # 순번 열 제외
-        vals = vals[1:]
-    return "|".join(vals)
+def to_record(row: dict) -> dict:
+    return {label: row.get(col, "") for col, label in COLUMNS}
 
 
 # ======================= 메인 =======================
@@ -434,10 +457,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--headed", action="store_true", help="브라우저 창 표시")
     ap.add_argument("--debug", action="store_true", help="단계별 스크린샷/HTML 저장")
     ap.add_argument("--dump-xhr", action="store_true", help="JSON 응답(XHR) 저장")
-    ap.add_argument("--inspect", action="store_true", help="발주목록 화면의 입력요소 구조만 저장하고 종료")
+    ap.add_argument("--inspect", action="store_true", help="입력요소 구조만 저장하고 종료")
     ap.add_argument("--keywords", nargs="+", default=KEYWORDS, help="사업명 검색어(복수)")
-    ap.add_argument("--months", type=int, default=MONTHS, help="오늘부터 N개월")
-    ap.add_argument("--start-url", default=None, help="발주게시판 URL을 알고 있으면 직접 이동")
+    ap.add_argument("--months", type=int, default=PERIOD_MONTHS, choices=[1, 3, 6],
+                    help="기간 버튼(최근 N개월)")
+    ap.add_argument("--start-url", default=None, help="발주목록 URL을 알면 직접 이동")
     ap.add_argument("--out", default="output", help="결과 폴더")
     ap.add_argument("--slow-mo", type=int, default=0, help="동작 지연(ms), 디버깅용")
     return ap.parse_args()
@@ -447,9 +471,7 @@ def main() -> int:
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    today = date.today()
-    d_from, d_to = today, add_months(today, args.months)
-    log(f"조건: {SEARCH_TYPE} / {BUSINESS_TYPE} / 진행일자 {d_from} ~ {d_to} / 검색어 {args.keywords}")
+    log(f"조건: {SEARCH_TYPE} / {BUSINESS_TYPE} / 최근 {args.months}개월(진행일자) / 검색어 {args.keywords}")
 
     merged: dict[str, dict] = {}
     with sync_playwright() as pw:
@@ -483,18 +505,34 @@ def main() -> int:
 
             for idx, kw in enumerate(args.keywords, 1):
                 log(f"[{idx}/{len(args.keywords)}] 검색어: '{kw}'")
-                apply_filters(page, kw, d_from, d_to)
+                close_popups(page)
+                set_search_type(page)
+                set_business_type(page)
+                set_period(page, args.months)
                 snap(page, out / "debug", f"02_filters_{idx}", args.debug)
-                run_search(page)
+                run_search(page, kw)
+                set_page_size(page)
+                total = get_total(page)
+                log(f"  검색 결과 전체 {total if total is not None else '?'}건")
                 snap(page, out / "debug", f"03_result_{idx}", args.debug)
 
-                for rec in collect_pages(page, kw):
-                    key = record_key(rec)
+                raw = collect_pages(page, total) if total != 0 else []
+                kept = 0
+                for row in raw:
+                    # 서버 필터 누락 방지: 업무구분·키워드 재검증
+                    if row.get("prcmBsneSeNm") != BUSINESS_TYPE:
+                        continue
+                    if norm(kw) not in norm(row.get("bizNm", "")):
+                        continue
+                    key = row.get("oderPlanNo") or "|".join(row.values())
+                    rec = to_record(row)
                     if key in merged:
                         merged[key]["검색어"].append(kw)
                     else:
                         rec["검색어"] = [kw]
                         merged[key] = rec
+                    kept += 1
+                log(f"  수집 {len(raw)}행 중 조건 일치 {kept}건")
                 time.sleep(PAUSE)
         except Exception as e:  # noqa: BLE001
             log(f"오류: {str(e)[:400]}")
@@ -505,28 +543,28 @@ def main() -> int:
             return 2
         browser.close()
 
-    records = list(merged.values())
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    records = sorted(merged.values(), key=lambda r: r.get("진행일자", ""), reverse=True)
+    now = datetime.now()
     for r in records:
         r["검색어"] = ", ".join(dict.fromkeys(r["검색어"]))
-        r["수집일시"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        r["수집일시"] = now.strftime("%Y-%m-%d %H:%M")
 
-    json_path = out / f"g2b_orderplan_{stamp}.json"
-    json_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-
+    stamp = now.strftime("%Y%m%d_%H%M")
+    (out / f"g2b_orderplan_{stamp}.json").write_text(
+        json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     if records:
-        fields = list(dict.fromkeys(k for r in records for k in r))
+        fields = [label for _, label in COLUMNS] + ["검색어", "수집일시"]
         csv_path = out / f"g2b_orderplan_{stamp}.csv"
         with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             w.writerows(records)
         log(f"완료: 중복 제거 후 {len(records)}건 → {csv_path}")
-        for r in records[:20]:
-            title = next((v for k, v in r.items() if "사업명" in k or "계획명" in k), None)
-            log(f"  · {title or list(r.values())[:4]}")
+        for r in records[:30]:
+            log(f"  · [{r['진행일자']}] {r['사업명']} / {r['수요기관']} ({r['발주계획번호']})")
     else:
-        log("완료: 조건에 맞는 건이 없습니다. (--headed --debug로 필터 적용 여부를 확인하세요)")
+        log("완료: 조건에 맞는 건이 없습니다.")
     return 0
 
 
