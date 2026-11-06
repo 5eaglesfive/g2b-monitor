@@ -7,8 +7,8 @@
   - 검색유형 : 발주계획
   - 업무구분 : 일반용역   (상세조건 영역의 체크박스)
   - 사업명   : "스마트경로당" "스마트 경로당" "경로당" "경로당 구축" (각각 검색 후 병합·중복제거)
-  - 발주시기 : 이번 달부터 앞으로 6개월 이내 (결과 표의 '발주시기' 열로 판정)
-  - 진행일자 : 발주계획 등록일 조회범위. 최근 12개월을 직접 입력 (발주시기 필터가 누락되지 않도록 넓게 조회)
+  - 진행일자 : 오늘 포함 최근 6개월 (예: 오늘이 2026-11-06이면 2026/05/07 ~ 2026/11/06)
+  - (선택) --order-months N : 결과의 '발주시기'가 이번 달부터 N개월 이내인 건만 추가로 남김
 
 설치
   pip install playwright
@@ -22,7 +22,7 @@
       # Gmail로 결과 발송 (신규 건만). 환경변수: GMAIL_USER, GMAIL_APP_PASSWORD, MAIL_TO
 
 ※ 선택자는 2026-11 화면(업로드 HTML)에서 확인한 id 기준입니다. 개편되면 [화면 설정]만 수정하세요.
-※ 진행일자 입력칸은 8자리 숫자(YYYYMMDD) 직접 입력을 지원합니다. 실패 시 '6개월' 버튼으로 대체합니다.
+※ 진행일자는 화면의 1/3/6개월 버튼을 누르고, 결과가 기대와 다르면 8자리 숫자(YYYYMMDD)로 직접 입력합니다.
 """
 from __future__ import annotations
 
@@ -48,8 +48,7 @@ from playwright.sync_api import Page, sync_playwright
 SEARCH_TYPE = "발주계획"
 BUSINESS_TYPE = "일반용역"
 KEYWORDS = ["스마트경로당", "스마트 경로당", "경로당", "경로당 구축"]
-ORDER_MONTHS = 6           # 발주시기: 이번 달부터 앞으로 N개월
-REG_MONTHS = 12            # 진행일자(등록일) 조회범위: 최근 N개월
+PERIOD_MONTHS = 6          # 진행일자: 오늘 포함 최근 N개월
 PAGE_SIZE = "100"          # 화면의 표시 건수 (10/30/50/100)
 
 # ======================= 화면 설정 (개편 시 여기만 수정) =======================
@@ -392,21 +391,29 @@ def type_date(page: Page, selector: str, d: date) -> bool:
     return el.input_value() == d.strftime("%Y/%m/%d")
 
 
-def set_period(page: Page, reg_months: int) -> str:
-    """진행일자(등록일) 조회범위: 최근 reg_months개월을 직접 입력. 실패 시 6개월 버튼으로 대체."""
+def set_period(page: Page, months: int) -> str:
+    """진행일자: 오늘 포함 최근 N개월. 1/3/6개월은 화면 버튼을 쓰고, 값이 다르면 직접 입력."""
     today = date.today()
-    start = add_months(today, -reg_months) + timedelta(days=1)
-    ok = type_date(page, SEL["date_from"], start) and type_date(page, SEL["date_to"], today)
-    if not ok:
-        log("  ! 진행일자 직접 입력 실패 → '6개월' 버튼으로 대체합니다.")
-        inp = page.locator(f'{SEL["period_radio"]}[title="6개월"]')
-        if not inp.count():
-            raise RuntimeError("진행일자 입력과 기간 버튼 모두 사용할 수 없습니다.")
-        click_option(page, inp.first)
-        page.wait_for_timeout(500)
-    d1 = page.locator(SEL["date_from"]).first.input_value()
-    d2 = page.locator(SEL["date_to"]).first.input_value()
-    log(f"  진행일자(등록일): {d1} ~ {d2}")
+    start = add_months(today, -months) + timedelta(days=1)
+    want = (start.strftime("%Y/%m/%d"), today.strftime("%Y/%m/%d"))
+
+    def current() -> tuple[str, str]:
+        return (
+            page.locator(SEL["date_from"]).first.input_value(),
+            page.locator(SEL["date_to"]).first.input_value(),
+        )
+
+    if months in (1, 3, 6):
+        inp = page.locator(f'{SEL["period_radio"]}[title="{months}개월"]')
+        if inp.count() and not is_checked(inp.first):
+            click_option(page, inp.first)
+            page.wait_for_timeout(500)
+    if current() != want:
+        log("  기간 버튼 결과가 예상과 달라 날짜를 직접 입력합니다.")
+        if not (type_date(page, SEL["date_from"], start) and type_date(page, SEL["date_to"], today)):
+            log("  ! 진행일자 직접 입력도 확인되지 않았습니다. 아래 표시된 기간을 확인하세요.")
+    d1, d2 = current()
+    log(f"  진행일자: {d1} ~ {d2} (오늘 포함 최근 {months}개월)")
     return f"{d1} ~ {d2}"
 
 
@@ -494,7 +501,7 @@ def to_record(row: dict) -> dict:
 
 
 # ======================= 메일 발송 (Gmail) =======================
-MAIL_COLS = ["사업명", "수요기관", "발주시기", "예산금액(원)", "진행일자", "진행상태", "발주계획번호"]
+MAIL_COLS = ["사업명", "수요기관", "진행일자", "발주시기", "예산금액(원)", "진행상태", "발주계획번호"]
 G2B_HOME = "https://www.g2b.go.kr/"
 
 
@@ -518,11 +525,12 @@ def build_mail(records: list[dict], period: str, order_range: str, keywords: lis
                sender: str, to_addrs: list[str]) -> EmailMessage:
     n = len(records)
     today = datetime.now().strftime("%Y-%m-%d")
-    subject = f"[나라장터] {BUSINESS_TYPE} 경로당 {SEARCH_TYPE} 발주예정 신규 {n}건 ({today})"
+    subject = (f"[나라장터] {BUSINESS_TYPE} 경로당 {SEARCH_TYPE} "
+               f"{'발주예정 ' if order_range else ''}신규 {n}건 ({today})")
     summary = [
         f"검색유형: {SEARCH_TYPE} / 업무구분: {BUSINESS_TYPE}",
-        f"발주시기: {order_range} (앞으로 {ORDER_MONTHS}개월 내 발주 예정)",
-        f"조회 범위(진행일자/등록일): {period or '-'}",
+        f"진행일자: {period or '-'}",
+        *([f"발주시기: {order_range}"] if order_range else []),
         f"사업명 검색어: {', '.join(keywords)}",
         f"신규 건수: {n}건",
     ]
@@ -544,7 +552,7 @@ def build_mail(records: list[dict], period: str, order_range: str, keywords: lis
         + "</div>"
     )
     text_lines = summary + [""] + [
-        f"- [{r.get('발주시기', '')}] {r.get('사업명', '')} / {r.get('수요기관', '')} ({r.get('발주계획번호', '')})"
+        f"- [{r.get('진행일자', '')}] {r.get('사업명', '')} / {r.get('수요기관', '')} ({r.get('발주계획번호', '')})"
         for r in records
     ] + ["", f"나라장터: {G2B_HOME} (발주 > 발주목록에서 발주계획번호로 검색)"]
 
@@ -584,10 +592,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dump-xhr", action="store_true", help="JSON 응답(XHR) 저장")
     ap.add_argument("--inspect", action="store_true", help="입력요소 구조만 저장하고 종료")
     ap.add_argument("--keywords", nargs="+", default=KEYWORDS, help="사업명 검색어(복수)")
-    ap.add_argument("--order-months", type=int, default=ORDER_MONTHS,
-                    help="발주시기: 이번 달부터 앞으로 N개월 이내 (기본 6)")
-    ap.add_argument("--reg-months", type=int, default=REG_MONTHS,
-                    help="진행일자(등록일) 조회범위: 최근 N개월 (기본 12)")
+    ap.add_argument("--months", type=int, default=PERIOD_MONTHS,
+                    help="진행일자: 오늘 포함 최근 N개월 (기본 6)")
+    ap.add_argument("--order-months", type=int, default=0,
+                    help="(선택) 발주시기가 이번 달부터 N개월 이내인 건만 남김. 0이면 사용 안 함")
     ap.add_argument("--start-url", default=None, help="발주목록 URL을 알면 직접 이동")
     ap.add_argument("--out", default="output", help="결과 폴더")
     ap.add_argument("--slow-mo", type=int, default=0, help="동작 지연(ms), 디버깅용")
@@ -602,12 +610,16 @@ def main() -> int:
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    today = date.today()
-    end_ym = add_months(today, args.order_months)
-    ym_from, ym_to = (today.year, today.month), (end_ym.year, end_ym.month)
-    order_range = f"{ym_from[0]}/{ym_from[1]:02d} ~ {ym_to[0]}/{ym_to[1]:02d}"
-    log(f"조건: {SEARCH_TYPE} / {BUSINESS_TYPE} / 발주시기 {order_range} / "
-        f"등록일 최근 {args.reg_months}개월 / 검색어 {args.keywords}")
+    ym_from = ym_to = None
+    order_range = ""
+    if args.order_months:
+        today = date.today()
+        end_ym = add_months(today, args.order_months)
+        ym_from, ym_to = (today.year, today.month), (end_ym.year, end_ym.month)
+        order_range = f"{ym_from[0]}/{ym_from[1]:02d} ~ {ym_to[0]}/{ym_to[1]:02d}"
+    log(f"조건: {SEARCH_TYPE} / {BUSINESS_TYPE} / 진행일자 오늘 포함 최근 {args.months}개월"
+        + (f" / 발주시기 {order_range}" if order_range else "")
+        + f" / 검색어 {args.keywords}")
 
     merged: dict[str, dict] = {}
     period = ""
@@ -645,7 +657,7 @@ def main() -> int:
                 close_popups(page)
                 set_search_type(page)
                 set_business_type(page)
-                period = set_period(page, args.reg_months)
+                period = set_period(page, args.months)
                 snap(page, out / "debug", f"02_filters_{idx}", args.debug)
                 run_search(page, kw)
                 set_page_size(page)
@@ -662,10 +674,11 @@ def main() -> int:
                         continue
                     if norm(kw) not in norm(row.get("bizNm", "")):
                         continue
-                    ym = ym_of(row.get("oderYymm", ""))  # 발주시기: 앞으로 N개월 이내만
-                    if ym is None or not (ym_from <= ym <= ym_to):
-                        out_of_range += 1
-                        continue
+                    if ym_from:  # --order-months 지정 시에만 발주시기 필터 적용
+                        ym = ym_of(row.get("oderYymm", ""))
+                        if ym is None or not (ym_from <= ym <= ym_to):
+                            out_of_range += 1
+                            continue
                     key = row.get("oderPlanNo") or "|".join(row.values())
                     rec = to_record(row)
                     if key in merged:
@@ -674,7 +687,8 @@ def main() -> int:
                         rec["검색어"] = [kw]
                         merged[key] = rec
                     kept += 1
-                log(f"  수집 {len(raw)}행 중 조건 일치 {kept}건 (발주시기 범위 밖/미기재 {out_of_range}건 제외)")
+                log(f"  수집 {len(raw)}행 중 조건 일치 {kept}건"
+                    + (f" (발주시기 범위 밖/미기재 {out_of_range}건 제외)" if ym_from else ""))
                 time.sleep(PAUSE)
         except Exception as e:  # noqa: BLE001
             log(f"오류: {str(e)[:400]}")
@@ -685,7 +699,9 @@ def main() -> int:
             return 2
         browser.close()
 
-    records = sorted(merged.values(), key=lambda r: (r.get("발주시기", ""), r.get("사업명", "")))
+    records = sorted(merged.values(), key=lambda r: r.get("진행일자", ""), reverse=True)
+    if order_range:
+        records.sort(key=lambda r: (r.get("발주시기", ""), r.get("사업명", "")))
     now = datetime.now()
     for r in records:
         r["검색어"] = ", ".join(dict.fromkeys(r["검색어"]))
@@ -704,7 +720,7 @@ def main() -> int:
             w.writerows(records)
         log(f"완료: 중복 제거 후 {len(records)}건 → {csv_path}")
         for r in records[:30]:
-            log(f"  · [발주 {r['발주시기']}] {r['사업명']} / {r['수요기관']} ({r['발주계획번호']})")
+            log(f"  · [{r['진행일자']}] {r['사업명']} / {r['수요기관']} (발주 {r['발주시기']}, {r['발주계획번호']})")
     else:
         log("완료: 조건에 맞는 건이 없습니다.")
 
