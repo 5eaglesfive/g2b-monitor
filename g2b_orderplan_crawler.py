@@ -266,6 +266,37 @@ def close_popups(page: Page, rounds: int = 4) -> int:
     return closed
 
 
+def close_popups_until_clear(page: Page, max_s: float = 10, quiet_s: float = 2.0) -> None:
+    """공지 팝업은 화면 로딩이 끝난 뒤 늦게 열리므로, 한동안 새 팝업이 없을 때까지 반복해서 닫는다."""
+    end = time.time() + max_s
+    last = time.time()
+    while time.time() < end:
+        if close_popups(page):
+            last = time.time()
+        elif time.time() - last >= quiet_s:
+            break
+        page.wait_for_timeout(500)
+
+
+def wait_form_ready(page: Page, timeout_s: float = 60) -> None:
+    """검색 화면이 실제로 준비될 때까지 대기: 사업명 입력칸 표시 + 기본 기간 채워짐 + '전체 N건' 표시.
+    (준비 전에 조작하면 요소가 안 보이거나 기본값이 비어 있어 클릭/선택이 실패한다)"""
+    end = time.time() + timeout_s
+    while time.time() < end:
+        try:
+            box = page.locator(SEL["biz_name"])
+            df = page.locator(SEL["date_from"])
+            if (box.count() and box.first.is_visible()
+                    and df.count() and df.first.input_value()
+                    and get_total(page) is not None):
+                log(f"  검색 화면 준비 완료 (+{int(time.time() - _T0)}s)")
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        page.wait_for_timeout(500)
+    raise RuntimeError(f"발주목록 검색 화면이 {int(timeout_s)}초 안에 준비되지 않았습니다.")
+
+
 def find_text(page: Page, text: str, wait_s: float = 20, exact: bool = True):
     end = time.time() + wait_s
     while True:
@@ -315,10 +346,8 @@ def open_board(page: Page, start_url: str | None) -> None:
         if not sub:
             raise RuntimeError(f"하위 메뉴 {SUB_MENU_NAMES}를 찾지 못했습니다.")
         sub.click()
-    settle(page, 2.5)
-    close_popups(page)  # 발주목록 화면의 공지 팝업은 화면 진입 후 열린다
-    if page.locator(SEL["biz_name"]).count() == 0:
-        raise RuntimeError("발주목록 검색 화면(사업명 입력칸)이 열리지 않았습니다.")
+    wait_form_ready(page)
+    close_popups_until_clear(page)  # 발주목록의 공지 팝업은 화면이 준비된 뒤 열린다
 
 
 def option_input(page: Page, prefix: str, title: str):
