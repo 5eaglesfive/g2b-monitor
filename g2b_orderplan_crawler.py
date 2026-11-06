@@ -314,8 +314,28 @@ def find_text(page: Page, text: str, wait_s: float = 20, exact: bool = True):
         page.wait_for_timeout(1000)
 
 
+def goto_with_retry(page: Page, url: str, attempts: int = 3, timeout_ms: int = 45000) -> None:
+    """접속 실패(시간 초과, chrome-error 페이지)는 일시적일 수 있어 간격을 늘리며 재시도한다."""
+    last = ""
+    for i in range(1, attempts + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if not page.url.startswith("chrome-error"):
+                return
+            last = "브라우저 오류 페이지(chrome-error)"
+        except Exception as e:  # noqa: BLE001
+            last = str(e).splitlines()[0][:150]
+        log(f"  접속 실패 ({i}/{attempts}): {last}")
+        if i < attempts:
+            page.wait_for_timeout(15000 * i)
+    raise RuntimeError(
+        f"나라장터({url})에 접속하지 못했습니다: {last}. "
+        "사이트 장애이거나 실행 환경(해외 IP)이 제한되었을 수 있습니다. 국내 PC/서버에서 실행해 보세요."
+    )
+
+
 def open_board(page: Page, start_url: str | None) -> None:
-    page.goto(start_url or BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    goto_with_retry(page, start_url or BASE_URL)
     settle(page, 3)
     close_popups(page)
     describe_page(page)
