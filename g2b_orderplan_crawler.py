@@ -194,22 +194,72 @@ def dismiss_popups(page: Page) -> None:
                 break
 
 
+BLOCK_HINTS = ["access denied", "forbidden", "접근이 제한", "접근 제한", "해외", "비정상", "차단"]
+
+
+def find_text(page: Page, text: str, wait_s: float = 20, exact: bool = True):
+    """모든 프레임에서 텍스트/링크/버튼을 최대 wait_s초 동안 폴링하며 찾는다."""
+    end = time.time() + wait_s
+    while True:
+        for fr in page.frames:
+            for loc in (
+                fr.get_by_text(text, exact=exact),
+                fr.get_by_role("link", name=text),
+                fr.get_by_role("button", name=text),
+            ):
+                el = first_visible(loc)
+                if el:
+                    return el
+        if time.time() >= end:
+            return None
+        page.wait_for_timeout(1000)
+
+
+def describe_page(page: Page) -> str:
+    """현재 페이지 상태를 로그로 남긴다(차단/미렌더링 원인 파악용)."""
+    try:
+        body = page.evaluate("() => (document.body ? document.body.innerText : '')")
+    except Exception:  # noqa: BLE001
+        body = ""
+    flat = re.sub(r"\s+", " ", body)
+    log(f"  페이지 제목: {page.title()!r} / URL: {page.url}")
+    log(f"  본문 앞부분: {flat[:300]!r}")
+    return flat
+
+
 def open_board(page: Page, start_url: str | None) -> None:
-    page.goto(start_url or BASE_URL, wait_until="domcontentloaded")
+    page.goto(start_url or BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception:  # noqa: BLE001
+        pass
     page.wait_for_timeout(3000)
     dismiss_popups(page)
+    flat = describe_page(page)
+    if len(flat) < 50 or any(h in flat.lower() for h in BLOCK_HINTS):
+        log("  ! 화면이 비었거나 접속 차단/오류 페이지로 보입니다. (해외 IP 차단 가능성)")
     if start_url:
         return
-    top = first_visible(page.get_by_text(MENU_PATH[0], exact=True))
+
+    top = find_text(page, MENU_PATH[0], 20)
+    if not top:  # 햄버거(전체메뉴) 뒤에 숨어 있는 경우
+        burger = find_text(page, "전체메뉴", 3)
+        if burger:
+            burger.click()
+            page.wait_for_timeout(800)
+            top = find_text(page, MENU_PATH[0], 5)
     if not top:
-        raise RuntimeError(f"상단 메뉴 '{MENU_PATH[0]}'를 찾지 못했습니다. --headed --debug로 확인하세요.")
+        raise RuntimeError(
+            f"상단 메뉴 '{MENU_PATH[0]}'를 찾지 못했습니다. "
+            "output/debug/error.png 와 위 '본문 앞부분' 로그를 확인하세요."
+        )
     top.hover()
     page.wait_for_timeout(600)
-    sub = first_visible(page.get_by_text(MENU_PATH[1], exact=True))
+    sub = find_text(page, MENU_PATH[1], 3)
     if not sub:
         top.click()
         page.wait_for_timeout(600)
-        sub = first_visible(page.get_by_text(MENU_PATH[1], exact=True))
+        sub = find_text(page, MENU_PATH[1], 5)
     if not sub:
         raise RuntimeError(f"하위 메뉴 '{MENU_PATH[1]}'를 찾지 못했습니다.")
     sub.click()
@@ -331,8 +381,20 @@ def main() -> int:
 
     merged: dict[str, dict] = {}
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=not args.headed, slow_mo=args.slow_mo)
-        ctx = browser.new_context(locale="ko-KR", viewport={"width": 1600, "height": 1000})
+        browser = pw.chromium.launch(
+            headless=not args.headed,
+            slow_mo=args.slow_mo,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            viewport={"width": 1600, "height": 1000},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
         page = ctx.new_page()
         page.set_default_timeout(15000)
         if args.dump_xhr:
@@ -359,6 +421,7 @@ def main() -> int:
                 time.sleep(PAUSE)
         except Exception as e:  # noqa: BLE001
             log(f"오류: {e}")
+            describe_page(page)
             snap(page, out / "debug", "error", True)
             browser.close()
             return 2
