@@ -8,6 +8,7 @@
   - 업무구분 : 일반용역   (상세조건 영역의 체크박스)
   - 사업명   : "스마트경로당" "스마트 경로당" "경로당" "경로당 구축" (각각 검색 후 병합·중복제거)
   - 진행일자 : 오늘 포함 최근 6개월 (예: 오늘이 2026-11-06이면 2026/05/07 ~ 2026/11/06)
+  - 발주시기 : 사이트 기본 조건(예: 2026/09~2027/09)은 해제하여 진행일자 기준으로 빠짐없이 조회
   - (선택) --order-months N : 결과의 '발주시기'가 이번 달부터 N개월 이내인 건만 추가로 남김
 
 설치
@@ -67,6 +68,7 @@ SEL = {
     "biz_name": "#mf_wfm_container_txtBizNm",                        # 사업명 입력
     "search_btn": "#mf_wfm_container_btnS0001",                      # 검색 버튼
     "detail_toggle": 'input[id$="btnSearchToggle"]',                 # 상세조건 열기/닫기
+    "order_ym": "input.calendar-year-month",                         # 상세조건의 발주시기(연월) 시작/종료
     "page_size": "#mf_wfm_container_sbxRecordCountPerPage",
     "page_apply": "#mf_wfm_container_btnAply",
     "pager": "#mf_wfm_container_pagelist",
@@ -510,6 +512,50 @@ def type_date(page: Page, selector: str, d: date) -> bool:
     return el.input_value() == d.strftime("%Y/%m/%d")
 
 
+def clear_order_ym(page: Page) -> None:
+    """상세조건의 '발주시기'에는 사이트 기본값(예: 2026/09 ~ 2027/09)이 들어 있어 그대로 두면 결과가 잘린다.
+    진행일자 기준으로 빠짐없이 수집하도록 이 조건을 해제한다(해제가 유지되지 않으면 넉넉한 범위를 입력)."""
+    els = page.locator(SEL["order_ym"])
+    if els.count() < 2:
+        log("  ! 발주시기 입력칸을 찾지 못했습니다 (사이트 기본 조건이 적용된 상태일 수 있음)")
+        return
+    if not els.first.is_visible():  # 상세조건이 접혀 있으면 펼친다
+        safe_click(first_visible(page.locator(SEL["detail_toggle"])))
+        page.wait_for_timeout(600)
+
+    def values() -> list[str]:
+        return [els.nth(i).input_value() for i in range(2)]
+
+    before = values()
+    for i in range(2):
+        try:
+            el = els.nth(i)
+            el.click(timeout=3000)
+            el.press("Control+A")
+            el.press("Delete")
+            el.press("Tab")
+        except Exception:  # noqa: BLE001
+            pass
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(300)
+    after = values()
+    if any(after):  # 비워도 다시 채워지면 넉넉한 범위를 직접 입력
+        y = date.today().year
+        for i, v in enumerate((f"{y - 1}01", f"{y + 2}12")):
+            try:
+                el = els.nth(i)
+                el.click(timeout=3000)
+                el.press("Control+A")
+                el.type(v, delay=40)
+                el.press("Tab")
+            except Exception:  # noqa: BLE001
+                pass
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        after = values()
+    log(f"  발주시기 조건: {before} → {after if any(after) else '제한 없음'}")
+
+
 def set_period(page: Page, months: int) -> str:
     """진행일자: 오늘 포함 최근 N개월. 1/3/6개월은 화면 버튼을 쓰고, 값이 다르면 직접 입력."""
     today = date.today()
@@ -796,6 +842,7 @@ def main() -> int:
                 close_popups(page)
                 set_search_type(page)
                 set_business_type(page)
+                clear_order_ym(page)
                 period = set_period(page, args.months)
                 snap(page, out / "debug", f"02_filters_{idx}", args.debug)
                 run_search(page, kw)
